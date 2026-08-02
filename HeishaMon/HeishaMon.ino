@@ -124,6 +124,7 @@ char log_msg[LOG_MSG_SIZE];
 char mqtt_topic[256];
 
 static int mqttReconnects = 0;
+static unsigned int mqttLogDropped = 0; //log lines thrown away because publishing them to mqtt failed
 
 // state for restoring known 1wire sensors from mqtt retained messages just after boot
 bool dallasMqttRestorePending = false;
@@ -571,12 +572,18 @@ void log_message(char* string)
     sprintf(log_topic, "%s/%s", heishamonSettings.mqtt_topic_base, mqtt_logtopic);
 
     if (!mqtt_client.publish(log_topic, log_line)) {
+      /* Just drop this log line. A failed publish usually means the tcp send buffer was
+         full for a moment, not that the broker is gone, and disconnecting over a log
+         message used to cause most of our mqtt reconnects. A connection that really is
+         lost gets picked up by the connected() check in the main loop. Do not call
+         log_message() from here, it would recurse.
+      */
+      mqttLogDropped++;
       if (heishamonSettings.logSerial1) {
         loggingSerial.print(millis());
         loggingSerial.print(F(": "));
-        loggingSerial.println(F("MQTT publish log message failed!"));
+        loggingSerial.println(F("MQTT publish log message failed, dropping this line"));
       }
-      mqtt_client.disconnect();
     }
   }
   //send log message to websocket
@@ -1707,7 +1714,8 @@ void setupMqtt() {
   }
   last_tls_enabled = heishamonSettings.mqtt_tls_enabled;
 #else
-  mqtt_client.setSocketTimeout(10); mqtt_client.setKeepAlive(5); //fast timeout, any slower will block the main loop too long
+  mqtt_client.setSocketTimeout(10); mqtt_client.setKeepAlive(30); //fast socket timeout, any slower will block the main loop too long.
+  //keepalive must not be short: the broker drops us after 1.5x it, so 5s left only 2.5s of slack and any hiccup on the wifi or at the broker cost us the connection. Matches the tls path above.
 #endif
   mqtt_client.setServer(heishamonSettings.mqtt_server, atoi(heishamonSettings.mqtt_port));
   mqtt_client.setCallback(mqtt_callback);
@@ -2170,6 +2178,10 @@ void loop() {
     message += readpercentage;
     message += F("% Rules active: ");
     message += nrrules;
+    if (mqttLogDropped > 0) { //only when it actually happens, so normal output is unchanged
+      message += F(" ## Mqtt log drops: ");
+      message += mqttLogDropped;
+    }
     log_message((char*)message.c_str());
 
     String stats;
