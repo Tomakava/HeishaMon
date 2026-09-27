@@ -1711,7 +1711,8 @@ void setupMqtt() {
   }
   last_tls_enabled = heishamonSettings.mqtt_tls_enabled;
 #else
-  mqtt_client.setSocketTimeout(10); mqtt_client.setKeepAlive(5); //fast timeout, any slower will block the main loop too long
+  mqtt_client.setSocketTimeout(5); mqtt_client.setKeepAlive(30); //socket timeout is how long we wait for the rest of an incoming packet or the connack, which blocks the main loop meanwhile.
+  //keepalive must not be short: the broker drops us after 1.5x it, so 5s left only 2.5s of slack and any hiccup on the wifi or at the broker cost us the connection. Matches the tls path above.
 #endif
   mqtt_client.setServer(heishamonSettings.mqtt_server, atoi(heishamonSettings.mqtt_port));
   mqtt_client.setCallback(mqtt_callback);
