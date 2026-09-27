@@ -5,6 +5,11 @@
 
 void websocket_write_all(char *data, uint16_t data_len);
 
+/* defined in HeishaMon.ino. A publish returning false means the write was short and the
+   mqtt byte stream is out of sync, which can only be fixed by reconnecting.
+*/
+bool mqttPublishChecked(PubSubClient &client, const char* topic, const char* payload, bool retain);
+
 unsigned long lastalldatatime = 0;
 unsigned long lastallextradatatime = 0;
 unsigned long lastalloptdatatime = 0;
@@ -311,7 +316,7 @@ void decode_heatpump_data(char* data, char* actData, PubSubClient &mqtt_client, 
       sprintf_P(log_msg, PSTR("received TOP%d %s: %s"), Topic_Number, topics[Topic_Number], Topic_Value.c_str());
       log_message(log_msg);
       sprintf_P(mqtt_topic, PSTR("%s/%s/%s"), mqtt_topic_base, mqtt_topic_values, topics[Topic_Number]);
-      mqtt_client.publish(mqtt_topic, Topic_Value.c_str(), MQTT_RETAIN_VALUES);
+      mqttPublishChecked(mqtt_client, mqtt_topic, Topic_Value.c_str(), MQTT_RETAIN_VALUES);
     }
   }
   memcpy(actData, data, DATASIZE);
@@ -357,7 +362,7 @@ void decode_heatpump_data_extra(char* data, char* actDataExtra, PubSubClient &mq
       sprintf_P(log_msg, PSTR("received XTOP%d %s: %s"), Topic_Number, xtopics[Topic_Number], Topic_Value.c_str());
       log_message(log_msg);
       sprintf_P(mqtt_topic, PSTR("%s/%s/%s"), mqtt_topic_base, mqtt_topic_xvalues, xtopics[Topic_Number]);
-      mqtt_client.publish(mqtt_topic, Topic_Value.c_str(), MQTT_RETAIN_VALUES);
+      mqttPublishChecked(mqtt_client, mqtt_topic, Topic_Value.c_str(), MQTT_RETAIN_VALUES);
     }
   }
   memcpy(actDataExtra, data, DATASIZE);
@@ -399,7 +404,7 @@ void decode_optional_heatpump_data(char* data, char* actOptData, PubSubClient & 
       sprintf_P(log_msg, PSTR("received OPT%d %s: %s"), Topic_Number, optTopics[Topic_Number], Topic_Value.c_str());
       log_message(log_msg);
       sprintf_P(mqtt_topic, PSTR("%s/%s/%s"), mqtt_topic_base, mqtt_topic_pcbvalues, optTopics[Topic_Number]);
-      mqtt_client.publish(mqtt_topic, Topic_Value.c_str(), MQTT_RETAIN_VALUES);
+      mqttPublishChecked(mqtt_client, mqtt_topic, Topic_Value.c_str(), MQTT_RETAIN_VALUES);
 
     }
   }

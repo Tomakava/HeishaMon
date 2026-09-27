@@ -3,6 +3,11 @@
 #include "s0.h"
 #include "rules.h"
 
+/* defined in HeishaMon.ino. A publish returning false can mean the write was short, which
+   truncates the packet and desyncs the mqtt stream; only a reconnect restores framing.
+*/
+bool mqttPublishChecked(PubSubClient &client, const char* topic, const char* payload, bool retain);
+
 #define MQTT_RETAIN_VALUES 1 // do we retain 1wire values?
 
 #define MINREPORTEDS0TIME 5000 // how often s0 Watts are reported (not faster than this)
@@ -168,18 +173,18 @@ void s0Loop(PubSubClient &mqtt_client, void (*log_message)(char*), char* mqtt_to
       log_message(log_msg);
       sprintf(valueStr, "%.2f", Watthour);
       sprintf_P(mqtt_topic, PSTR("%s/%s/Watthour/%d"), mqtt_topic_base, mqtt_topic_s0, (i + 1));
-      mqtt_client.publish(mqtt_topic, valueStr, MQTT_RETAIN_VALUES);
+      mqttPublishChecked(mqtt_client, mqtt_topic, valueStr, MQTT_RETAIN_VALUES);
 
       sprintf(log_msg, PSTR("Measured total Watthour on S0 port %d: %.2f"), (i + 1),  WatthourTotal );
       log_message(log_msg);
       sprintf(valueStr, "%.2f", WatthourTotal);
       sprintf(mqtt_topic, PSTR("%s/%s/WatthourTotal/%d"), mqtt_topic_base, mqtt_topic_s0, (i + 1));
-      mqtt_client.publish(mqtt_topic, valueStr, MQTT_RETAIN_VALUES);
+      mqttPublishChecked(mqtt_client, mqtt_topic, valueStr, MQTT_RETAIN_VALUES);
       sprintf(log_msg, PSTR("Calculated Watt on S0 port %d: %u"), (i + 1), actS0Data[i].watt);
       log_message(log_msg);
       sprintf(valueStr, "%u",  actS0Data[i].watt);
       sprintf(mqtt_topic, PSTR("%s/%s/Watt/%d"), mqtt_topic_base, mqtt_topic_s0, (i + 1));
-      mqtt_client.publish(mqtt_topic, valueStr, MQTT_RETAIN_VALUES);
+      mqttPublishChecked(mqtt_client, mqtt_topic, valueStr, MQTT_RETAIN_VALUES);
       //update GUI over websocket
       sprintf_P(log_msg, PSTR("{\"data\": {\"s0values\": {\"s0port\": %d, \"Watt\": %u, \"Watthour\": %.2f, \"WatthourTotal\": %.2f}}}"), i+1, actS0Data[i].watt,Watthour,WatthourTotal);
       websocket_write_all(log_msg, strlen(log_msg));         
