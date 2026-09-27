@@ -162,6 +162,19 @@ const char *getResetReason() {
 #endif
 }
 
+/* diagnostics, published on the retained <base>/diagnostics topic next to stats. Counters run
+   since boot so a publish that does not make it loses nothing. Values named per interval
+   restart after each diagnostics publish.
+*/
+unsigned long loopLastStart = 0;
+unsigned long loopMaxInterval = 0; //longest time between two loop() starts in this interval
+unsigned long loopMaxBoot = 0;     //same, since boot
+unsigned long loopSlow = 0;        //loops over 100ms, long enough to hold up wifi and serial handling
+unsigned long loopStalls = 0;      //loops over 1s
+#if defined(ESP8266)
+uint32_t minFreeHeap = UINT32_MAX; //the esp32 core tracks this itself
+#endif
+
 // state for restoring known 1wire sensors from mqtt retained messages just after boot
 bool dallasMqttRestorePending = false;
 unsigned long dallasMqttRestoreStart = 0;
@@ -2112,7 +2125,54 @@ void checkBootButton() {
   }
 }
 
+/* Time between two loop() starts. On the esp8266 the network stack mostly runs between
+   loop() passes, so a long pass here also means late acks and dropped incoming packets.
+*/
+void trackLoopTime() {
+  unsigned long now = millis();
+  if (loopLastStart != 0) {
+    unsigned long took = now - loopLastStart;
+    if (took > loopMaxInterval) loopMaxInterval = took;
+    if (took > loopMaxBoot) loopMaxBoot = took;
+    if (took > 100) loopSlow++;
+    if (took > 1000) loopStalls++;
+  }
+  loopLastStart = now;
+#if defined(ESP8266)
+  uint32_t heap = ESP.getFreeHeap();
+  if (heap < minFreeHeap) minFreeHeap = heap;
+#endif
+}
+
+void publishDiagnostics() {
+  String diag;
+#ifdef ESP8266
+  diag.reserve(640);
+#endif
+  diag += F("{\"loop max ms\":");
+  diag += loopMaxInterval;
+  diag += F(",\"loop max ms boot\":");
+  diag += loopMaxBoot;
+  diag += F(",\"slow loops\":");
+  diag += loopSlow;
+  diag += F(",\"loop stalls\":");
+  diag += loopStalls;
+  diag += F(",\"min free heap\":");
+#if defined(ESP8266)
+  diag += minFreeHeap;
+#else
+  diag += ESP.getMinFreeHeap();
+#endif
+  diag += F("}");
+  sprintf_P(mqtt_topic, PSTR("%s/diagnostics"), heishamonSettings.mqtt_topic_base);
+  mqttPublishChecked(mqtt_client, mqtt_topic, diag.c_str(), MQTT_RETAIN_VALUES);
+
+  loopMaxInterval = 0;
+}
+
 void loop() {
+  trackLoopTime();
+
   //check boot button state
   checkBootButton();
 
@@ -2258,6 +2318,11 @@ void loop() {
       message += F(" ## Last reset: ");
       message += resetReason;
     }
+    if (loopMaxInterval >= 100) { //only when the loop was slow in this interval
+      message += F(" ## Longest loop: ");
+      message += loopMaxInterval;
+      message += F(" ms");
+    }
     log_message((char*)message.c_str());
 
     String stats;
@@ -2309,6 +2374,7 @@ void loop() {
     stats += F("}");
     sprintf_P(mqtt_topic, PSTR("%s/stats"), heishamonSettings.mqtt_topic_base);
     mqttPublishChecked(mqtt_client, mqtt_topic, stats.c_str(), MQTT_RETAIN_VALUES);
+    publishDiagnostics();
 
     //websocket stats
 #ifdef ESP32
