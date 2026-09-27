@@ -55,7 +55,8 @@ ADC_MODE(ADC_VCC);
 
 const byte DNS_PORT = 53;
 
-#define SERIALTIMEOUT 2000 // wait until all 203 bytes are read, must not be too long to avoid blocking the code
+#define SERIALTIMEOUT 4500 // wait until all 203 bytes are read, must not be too long to avoid blocking the code
+                           // stays below the minimum waitTime of 5s so we always give up before the next query
 
 settingsStruct heishamonSettings;
 
@@ -838,7 +839,32 @@ void pushCommandBuffer(byte* command, int length) {
   cmdnrel++;
 }
 
+/* Anything left in the rx buffer when we are about to send can only be a late answer
+   to an earlier query. Reading it as the answer to this query puts heishamon one
+   datagram behind and it stays there, so drop it. Returns the number of bytes dropped;
+   the caller logs it because the esp32 tx task may not call log_message directly.
+   Only call this while not sending, otherwise readSerial may be halfway through
+   collecting a datagram.
+*/
+int flushHeatpumpRx() {
+  int stale = 0;
+  while (heatpumpSerial.available()) {
+    heatpumpSerial.read();
+    stale++;
+  }
+  return stale;
+}
+
 #ifdef ESP32
+//same as the esp8266 path in send_command, but this task must not call log_message itself
+static void flushHeatpumpRxLogged(char *local_log_msg) {
+  int stale = flushHeatpumpRx();
+  if (stale > 0) {
+    sprintf_P(local_log_msg, PSTR("Discarded %d stale bytes before sending (previous answer arrived too late)"), stale);
+    xQueueSend(logQueue, local_log_msg, 0);
+  }
+}
+
 void serialTXTask(void *pvParameters) {
   unsigned long lastPCBSendTime = 0;
   unsigned long lastHPSendTime = 0;
@@ -861,6 +887,7 @@ void serialTXTask(void *pvParameters) {
     if ((!sending) && ((unsigned long)(now - lastPCBSendTime) >= OPTIONALPCBQUERYTIME)) {
       lastPCBSendTime = now;
       if (heishamonSettings.optionalPCB && !heishamonSettings.listenonly) {
+        flushHeatpumpRxLogged(local_log_msg);
         sending = true;
         sendCommandReadTime = now;
         xQueuePeek(pcbQueue, localPCBQuery, 0);
@@ -880,6 +907,7 @@ void serialTXTask(void *pvParameters) {
     // second priority: static heatpump query every waitTime seconds
     if ((!sending) && (!heishamonSettings.listenonly)) {
       if ((unsigned long)(now - lastHPSendTime) >= (1000 * heishamonSettings.waitTime)) {
+        flushHeatpumpRxLogged(local_log_msg);
         sending = true;
         sendCommandReadTime = now;
         lastHPSendTime = now;
@@ -895,6 +923,7 @@ void serialTXTask(void *pvParameters) {
     if ((!sending) && (!heishamonSettings.listenonly) && extraDataBlockAvailable) {
       if ((unsigned long)(now - lastHPExtraSendTime) >= (1000 * heishamonSettings.waitTime)) {
         lastHPExtraSendTime = now;
+        flushHeatpumpRxLogged(local_log_msg);
         sending = true;
         sendCommandReadTime = now;
         panasonicQuery[3] = 0x21;
@@ -910,6 +939,7 @@ void serialTXTask(void *pvParameters) {
     if ((!sending) && (!heishamonSettings.listenonly)) {
       struct cmdbuffer_t cmd;
       if (xQueueReceive(cmdQueue, &cmd, 0) == pdTRUE) {
+        flushHeatpumpRxLogged(local_log_msg);
         sending = true;
         sendCommandReadTime = now;
         byte chk = calcChecksum(cmd.data, cmd.length);
@@ -947,6 +977,13 @@ bool send_command(byte* command, int length) {
     pushCommandBuffer(command, length);
     return false;
   }
+
+  int stale = flushHeatpumpRx(); //drop a late answer to an earlier query, it is not the answer to this one
+  if (stale > 0) {
+    sprintf_P(log_msg, PSTR("Discarded %d stale bytes before sending (previous answer arrived too late)"), stale);
+    log_message(log_msg);
+  }
+
   sending = true; //simple semaphore to only allow one send command at a time, semaphore ends when answered data is received
 
   byte chk = calcChecksum(command, length);
