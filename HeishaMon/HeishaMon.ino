@@ -126,6 +126,7 @@ char log_msg[LOG_MSG_SIZE];
 char mqtt_topic[256];
 
 static int mqttReconnects = 0;
+unsigned int mqttPublishFails = 0; //publishes that returned false, meaning a short write truncated the packet
 
 // state for restoring known 1wire sensors from mqtt retained messages just after boot
 bool dallasMqttRestorePending = false;
@@ -475,7 +476,7 @@ void publishRuleExecution(const char *name, uint32_t id, int result, uint32_t du
   if (len <= 0 || len >= (int)sizeof(payload)) return;
   char topic[256];
   snprintf(topic, sizeof(topic), "%s/rules/executed", heishamonSettings.mqtt_topic_base);
-  mqtt_client.publish(topic, payload, false);
+  mqttPublishChecked(mqtt_client, topic, payload, false);
 }
 
 void publishRulesState(bool force) {
@@ -488,7 +489,7 @@ void publishRulesState(bool force) {
   if (force || periodic || reported != state) {
     char topic[256];
     snprintf(topic, sizeof(topic), "%s/rules/state", heishamonSettings.mqtt_topic_base);
-    if (mqtt_client.publish(topic, state ? "1" : "0", true)) {
+    if (mqttPublishChecked(mqtt_client, topic, state ? "1" : "0", true)) {
       reported = state;
       lastPublish = now;
     } else {
@@ -553,15 +554,15 @@ void mqtt_reconnect()
       sprintf(topic, "%s/%s", heishamonSettings.mqtt_topic_base, mqtt_send_raw_value_topic);
       mqtt_client.subscribe(topic);
       sprintf(topic, "%s/%s", heishamonSettings.mqtt_topic_base, mqtt_willtopic);
-      mqtt_client.publish(topic, "Online");
+      mqttPublishChecked(mqtt_client, topic, "Online", false);
       sprintf(topic, "%s/%s", heishamonSettings.mqtt_topic_base, mqtt_iptopic);
 #ifdef ESP8266
-      mqtt_client.publish(topic, WiFi.localIP().toString().c_str(), true);
+      mqttPublishChecked(mqtt_client, topic, WiFi.localIP().toString().c_str(), true);
 #else
       if (ETH.hasIP()) {
-        mqtt_client.publish(topic, ETH.localIP().toString().c_str(), true);
+        mqttPublishChecked(mqtt_client, topic, ETH.localIP().toString().c_str(), true);
       } else {
-        mqtt_client.publish(topic, WiFi.localIP().toString().c_str(), true);
+        mqttPublishChecked(mqtt_client, topic, WiFi.localIP().toString().c_str(), true);
       }
 #endif
 
@@ -650,11 +651,14 @@ void log_message(char* string)
     char log_topic[256];
     sprintf(log_topic, "%s/%s", heishamonSettings.mqtt_topic_base, mqtt_logtopic);
 
+    /* Same short-write case as mqttPublishChecked, handled inline. Don't call
+       log_message() from here, it would recurse. */
     if (!mqtt_client.publish(log_topic, log_line)) {
+      mqttPublishFails++;
       if (heishamonSettings.logSerial1) {
         loggingSerial.print(millis());
         loggingSerial.print(F(": "));
-        loggingSerial.println(F("MQTT publish log message failed!"));
+        loggingSerial.println(F("MQTT publish log message failed, reconnecting to resync"));
       }
       mqtt_client.disconnect();
     }
@@ -680,6 +684,25 @@ void logHex(char *hex, byte hex_len) {
   }
 }
 
+/* publish() returns false after a short write, which leaves half a packet on the wire.
+   MQTT can't resync a byte stream, so disconnect and let the loop reconnect. */
+bool mqttPublishChecked(PubSubClient &client, const char* topic, const char* payload, bool retain) {
+  if (client.publish(topic, payload, retain)) return true;
+  /* Once we have dropped the connection the rest of a publish burst fails too, and those are
+     expected, so do not count them or disconnect again.
+  */
+  if (!client.connected()) return false;
+  mqttPublishFails++;
+  /* publish() also returns false when the message does not fit the buffer, but that is
+     rejected before anything is written so the stream is still intact and reconnecting would
+     not help. Only a short write truncates a packet, and only that needs a resync.
+  */
+  if (client.getBufferSize() >= (MQTT_MAX_HEADER_SIZE + 2 + strlen(topic) + strlen(payload))) {
+    client.disconnect();
+  }
+  return false;
+}
+
 void mqttPublish(char* topic, char* subtopic, char* value) {
   mqttPublish(topic, subtopic, value, MQTT_RETAIN_VALUES);
 }
@@ -687,7 +710,7 @@ void mqttPublish(char* topic, char* subtopic, char* value) {
 void mqttPublish(char* topic, char* subtopic, char* value, bool retain) {
   char mqtt_topic[256];
   sprintf_P(mqtt_topic, PSTR("%s/%s/%s"), heishamonSettings.mqtt_topic_base, topic, subtopic);
-  mqtt_client.publish(mqtt_topic, value, retain);
+  mqttPublishChecked(mqtt_client, mqtt_topic, value, retain);
 }
 
 
@@ -2364,6 +2387,10 @@ void loop() {
     message += readpercentage;
     message += F("% Rules active: ");
     message += nrrules;
+    if (mqttPublishFails > 0) { //only when it actually happens, so normal output is unchanged
+      message += F(" ## Mqtt publish fails: ");
+      message += mqttPublishFails;
+    }
     log_message((char*)message.c_str());
 
     String stats;
@@ -2412,7 +2439,7 @@ void loop() {
     stats += nrrules;
     stats += F("}");
     sprintf_P(mqtt_topic, PSTR("%s/stats"), heishamonSettings.mqtt_topic_base);
-    mqtt_client.publish(mqtt_topic, stats.c_str(), MQTT_RETAIN_VALUES);
+    mqttPublishChecked(mqtt_client, mqtt_topic, stats.c_str(), MQTT_RETAIN_VALUES);
 
     //websocket stats
 #ifdef ESP32
@@ -2450,7 +2477,7 @@ void loop() {
 
     //Make sure the LWT is set to Online, even if the broker have marked it dead.
     sprintf_P(mqtt_topic, PSTR("%s/%s"), heishamonSettings.mqtt_topic_base, mqtt_willtopic);
-    mqtt_client.publish(mqtt_topic, "Online");
+    mqttPublishChecked(mqtt_client, mqtt_topic, "Online", false);
 
 #ifdef ESP8266
     if (WiFi.isConnected()) {

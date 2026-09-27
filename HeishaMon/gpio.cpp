@@ -4,6 +4,10 @@
 #include "src/common/progmem.h"
 #include "src/common/stricmp.h"
 #include "src/common/webserver.h"
+
+// defined in HeishaMon.ino
+bool mqttPublishChecked(PubSubClient &client, const char* topic, const char* payload, bool retain);
+
 const char* mqtt_topic_gpio PROGMEM = "gpio";
 
 void log_message(char* string);
@@ -216,7 +220,7 @@ void publishGPIOStates(PubSubClient &mqtt_client, gpioSettingsStruct &gpioSettin
     if (publishAll || (state != reportedState[i]) || (isInput && resendInputs)) {
       gpioTopicName(i, name, sizeof(name));
       snprintf_P(topic, sizeof(topic), PSTR("%s/gpio/%s/state"), mqtt_topic_base, name);
-      if (mqtt_client.publish(topic, state ? "1" : "0", true)) {
+      if (mqttPublishChecked(mqtt_client, topic, state ? "1" : "0", true)) {
         reportedState[i] = state;
       } else {
         reportedState[i] = -1; // retry on the next loop

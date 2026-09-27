@@ -8,6 +8,9 @@
 #include <ArduinoJson.h>
 #include <LittleFS.h>
 
+// defined in HeishaMon.ino
+bool mqttPublishChecked(PubSubClient &client, const char* topic, const char* payload, bool retain);
+
 #define MQTT_RETAIN_VALUES 1 // do we retain 1wire values?
 
 #define MAXTEMPDIFFPERSEC 0.5 // what is the allowed temp difference per second which is allowed (to filter bad values)
@@ -171,14 +174,14 @@ void readNewDallasTemp(PubSubClient &mqtt_client, void (*log_message)(char*), ch
           log_message(log_msg);
           if (true) {
             sprintf_P(valueStr, PSTR("%.2f"), actDallasData[i].temperature);
-            sprintf_P(mqtt_topic, PSTR("%s/%s/%s"), mqtt_topic_base, mqtt_topic_1wire, actDallasData[i].address); mqtt_client.publish(mqtt_topic, valueStr, MQTT_RETAIN_VALUES);
+            sprintf_P(mqtt_topic, PSTR("%s/%s/%s"), mqtt_topic_base, mqtt_topic_1wire, actDallasData[i].address); mqttPublishChecked(mqtt_client, mqtt_topic, valueStr, MQTT_RETAIN_VALUES);
             sprintf_P(valueStr, PSTR("%s"), actDallasData[i].alias);
-            sprintf_P(mqtt_topic, PSTR("%s/%s/%s/alias"), mqtt_topic_base, mqtt_topic_1wire, actDallasData[i].address); mqtt_client.publish(mqtt_topic, valueStr, MQTT_RETAIN_VALUES);
+            sprintf_P(mqtt_topic, PSTR("%s/%s/%s/alias"), mqtt_topic_base, mqtt_topic_1wire, actDallasData[i].address); mqttPublishChecked(mqtt_client, mqtt_topic, valueStr, MQTT_RETAIN_VALUES);
             sprintf_P(valueStr, PSTR("%.1f"), actDallasData[i].offset);
-            sprintf_P(mqtt_topic, PSTR("%s/%s/%s/offset"), mqtt_topic_base, mqtt_topic_1wire, actDallasData[i].address); mqtt_client.publish(mqtt_topic, valueStr, MQTT_RETAIN_VALUES);
+            sprintf_P(mqtt_topic, PSTR("%s/%s/%s/offset"), mqtt_topic_base, mqtt_topic_1wire, actDallasData[i].address); mqttPublishChecked(mqtt_client, mqtt_topic, valueStr, MQTT_RETAIN_VALUES);
           } else {
             sprintf_P(valueStr, PSTR("{\"Temperature\":%.2f,\"Alias\":\"%s\"}"), actDallasData[i].temperature, actDallasData[i].alias);
-            sprintf_P(mqtt_topic, PSTR("%s/%s/%s"), mqtt_topic_base, mqtt_topic_1wire, actDallasData[i].address); mqtt_client.publish(mqtt_topic, valueStr, MQTT_RETAIN_VALUES);
+            sprintf_P(mqtt_topic, PSTR("%s/%s/%s"), mqtt_topic_base, mqtt_topic_1wire, actDallasData[i].address); mqttPublishChecked(mqtt_client, mqtt_topic, valueStr, MQTT_RETAIN_VALUES);
           }
           sprintf_P(log_msg, PSTR("{\"data\": {\"dallasvalues\": {\"sensorID\": \"%s\", \"value\": %.2f}}}"), actDallasData[i].address, actDallasData[i].temperature);
           websocket_write_all(log_msg, strlen(log_msg));          
@@ -290,9 +293,9 @@ void removeDallasSensor(PubSubClient &mqtt_client, char* mqtt_topic_base, char* 
 
   char mqtt_topic[256];
   // publishing an empty retained payload clears the previously retained message on the broker
-  sprintf_P(mqtt_topic, PSTR("%s/%s/%s"), mqtt_topic_base, mqtt_topic_1wire, address); mqtt_client.publish(mqtt_topic, "", true);
-  sprintf_P(mqtt_topic, PSTR("%s/%s/%s/alias"), mqtt_topic_base, mqtt_topic_1wire, address); mqtt_client.publish(mqtt_topic, "", true);
-  sprintf_P(mqtt_topic, PSTR("%s/%s/%s/offset"), mqtt_topic_base, mqtt_topic_1wire, address); mqtt_client.publish(mqtt_topic, "", true);
+  sprintf_P(mqtt_topic, PSTR("%s/%s/%s"), mqtt_topic_base, mqtt_topic_1wire, address); mqttPublishChecked(mqtt_client, mqtt_topic, "", true);
+  sprintf_P(mqtt_topic, PSTR("%s/%s/%s/alias"), mqtt_topic_base, mqtt_topic_1wire, address); mqttPublishChecked(mqtt_client, mqtt_topic, "", true);
+  sprintf_P(mqtt_topic, PSTR("%s/%s/%s/offset"), mqtt_topic_base, mqtt_topic_1wire, address); mqttPublishChecked(mqtt_client, mqtt_topic, "", true);
 
   sprintf_P(log_msg, PSTR("Removed 1wire sensor: %s"), address); log_message(log_msg);
 
@@ -425,13 +428,13 @@ bool changeDallasOffset(PubSubClient &mqtt_client, char* mqtt_topic_base, char* 
   sprintf_P(log_msg, PSTR("1wire sensor %s offset set to %.1f"), actDallasData[slot].address, newOffset); log_message(log_msg);
 
   sprintf_P(valueStr, PSTR("%.1f"), newOffset);
-  sprintf_P(mqtt_topic, PSTR("%s/%s/%s/offset"), mqtt_topic_base, mqtt_topic_1wire, actDallasData[slot].address); mqtt_client.publish(mqtt_topic, valueStr, MQTT_RETAIN_VALUES);
+  sprintf_P(mqtt_topic, PSTR("%s/%s/%s/offset"), mqtt_topic_base, mqtt_topic_1wire, actDallasData[slot].address); mqttPublishChecked(mqtt_client, mqtt_topic, valueStr, MQTT_RETAIN_VALUES);
 
   if (actDallasData[slot].temperature != -127.0) {
     // shift the last known value right away, so mqtt, web and rules don't have to wait for the next reading
     actDallasData[slot].temperature += diff;
     sprintf_P(valueStr, PSTR("%.2f"), actDallasData[slot].temperature);
-    sprintf_P(mqtt_topic, PSTR("%s/%s/%s"), mqtt_topic_base, mqtt_topic_1wire, actDallasData[slot].address); mqtt_client.publish(mqtt_topic, valueStr, MQTT_RETAIN_VALUES);
+    sprintf_P(mqtt_topic, PSTR("%s/%s/%s"), mqtt_topic_base, mqtt_topic_1wire, actDallasData[slot].address); mqttPublishChecked(mqtt_client, mqtt_topic, valueStr, MQTT_RETAIN_VALUES);
     sprintf_P(log_msg, PSTR("{\"data\": {\"dallasvalues\": {\"sensorID\": \"%s\", \"value\": %.2f, \"offset\": %.1f}}}"), actDallasData[slot].address, actDallasData[slot].temperature, newOffset);
     websocket_write_all(log_msg, strlen(log_msg));
     rules_event_cb(_F("ds18b20#"), actDallasData[slot].address);
