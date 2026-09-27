@@ -183,6 +183,16 @@ unsigned long loopStalls = 0;      //loops over 1s
 #if defined(ESP8266)
 uint32_t minFreeHeap = UINT32_MAX; //the esp32 core tracks this itself
 #endif
+volatile bool wifiLinkUp = false;             //set from the wifi event callbacks
+volatile unsigned int wifiDisconnects = 0;    //drops from a connected state, not failed reconnect attempts
+volatile int wifiLastDisconnectReason = 0;    //802.11 reason code, 200 and up are esp specific (200 = beacon timeout)
+int wifiRssiMin = 0;                          //range over this interval, 0 = no sample yet
+int wifiRssiMax = 0;
+unsigned long lastRssiSample = 0;
+#if defined(ESP8266)
+WiFiEventHandler wifiConnectedHandler;
+WiFiEventHandler wifiDisconnectedHandler;
+#endif
 
 // state for restoring known 1wire sensors from mqtt retained messages just after boot
 bool dallasMqttRestorePending = false;
@@ -2014,6 +2024,7 @@ void setup() {
   loadSettings(&heishamonSettings);
 
   loggingSerial.println(F("Setup wifi..."));
+  setupWifiDiagnostics();
   setupWifi(&heishamonSettings);
   lastWifiRetryTimer = millis();
 
@@ -2188,6 +2199,42 @@ void trackMqttOffline() {
   }
 }
 
+/* A dropped association and a stalled link look the same from mqtt. The disconnect event
+   says which it was, and why.
+*/
+void setupWifiDiagnostics() {
+#if defined(ESP8266)
+  wifiConnectedHandler = WiFi.onStationModeConnected([](const WiFiEventStationModeConnected &event) {
+    wifiLinkUp = true;
+  });
+  wifiDisconnectedHandler = WiFi.onStationModeDisconnected([](const WiFiEventStationModeDisconnected &event) {
+    if (wifiLinkUp) wifiDisconnects++;
+    wifiLinkUp = false;
+    wifiLastDisconnectReason = event.reason;
+  });
+#else
+  WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
+    wifiLinkUp = true;
+  }, ARDUINO_EVENT_WIFI_STA_CONNECTED);
+  WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
+    if (wifiLinkUp) wifiDisconnects++;
+    wifiLinkUp = false;
+    wifiLastDisconnectReason = info.wifi_sta_disconnected.reason;
+  }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+#endif
+}
+
+//the stats line only shows the rssi at that moment, a fade between two of them is invisible
+void trackWifiRssi() {
+  if ((unsigned long)(millis() - lastRssiSample) < 1000) return;
+  lastRssiSample = millis();
+  if (!WiFi.isConnected()) return;
+  int rssi = WiFi.RSSI();
+  if (rssi >= 0) return; //not a real reading
+  if ((wifiRssiMin == 0) || (rssi < wifiRssiMin)) wifiRssiMin = rssi;
+  if ((wifiRssiMax == 0) || (rssi > wifiRssiMax)) wifiRssiMax = rssi;
+}
+
 void publishDiagnostics() {
   String diag;
 #ifdef ESP8266
@@ -2225,11 +2272,36 @@ void publishDiagnostics() {
   diag += mqttOfflineSeconds;
   diag += F(",\"mqtt longest offline s\":");
   diag += mqttLongestOfflineSeconds;
+  diag += F(",\"wifi disconnects\":");
+  diag += wifiDisconnects;
+  diag += F(",\"wifi disconnect reason\":");
+  diag += wifiLastDisconnectReason;
+  diag += F(",\"rssi min\":");
+  diag += wifiRssiMin;
+  diag += F(",\"rssi max\":");
+  diag += wifiRssiMax;
+  diag += F(",\"wifi channel\":");
+  diag += WiFi.channel();
+  diag += F(",\"wifi bssid\":\"");
+  diag += WiFi.BSSIDstr();
+#if defined(ESP8266)
+  //the mode the esp is configured for, the ap may still settle on a lower one
+  diag += F("\",\"wifi phy mode\":\"");
+  switch (WiFi.getPhyMode()) {
+    case WIFI_PHY_MODE_11B: diag += F("11b"); break;
+    case WIFI_PHY_MODE_11G: diag += F("11g"); break;
+    case WIFI_PHY_MODE_11N: diag += F("11n"); break;
+    default:                diag += F("unknown"); break;
+  }
+#endif
+  diag += F("\"");
   diag += F("}");
   sprintf_P(mqtt_topic, PSTR("%s/diagnostics"), heishamonSettings.mqtt_topic_base);
   mqttPublishChecked(mqtt_client, mqtt_topic, diag.c_str(), MQTT_RETAIN_VALUES);
 
   loopMaxInterval = 0;
+  wifiRssiMin = 0;
+  wifiRssiMax = 0;
 }
 
 void loop() {
@@ -2243,6 +2315,7 @@ void loop() {
 
   // check wifi
   check_wifi();
+  trackWifiRssi();
   // Handle OTA first.s
   ArduinoOTA.handle();
 
@@ -2387,6 +2460,13 @@ void loop() {
     if (resetWasCrash) {
       message += F(" ## Last reset: ");
       message += resetReason;
+    }
+    if (wifiDisconnects > 0) {
+      message += F(" ## Wifi drops: ");
+      message += wifiDisconnects;
+      message += F(" (last reason ");
+      message += wifiLastDisconnectReason;
+      message += F(")");
     }
     if (mqttConnectFails > 0) {
       message += F(" ## Mqtt connect fails: ");
