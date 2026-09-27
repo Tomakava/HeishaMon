@@ -125,6 +125,10 @@ char mqtt_topic[256];
 
 static int mqttReconnects = 0;
 unsigned int mqttPublishFails = 0; //publishes that returned false, meaning a short write truncated the packet
+unsigned int mqttPublishStalls = 0; //of those, the ones where the write waited before giving up, i.e. no acks came back
+unsigned long lastPublishFailMs = 0; //how long the last failed publish took
+unsigned int lastPublishFailBytes = 0;
+char lastPublishFailTopic[64] = "";
 
 /* why the last boot happened. Kept for the whole run and reported in the stats topic,
    because a crash on a remote device is otherwise invisible without a serial capture.
@@ -637,8 +641,9 @@ void log_message(char* string)
        half a packet on the wire. Cannot use the helper here because it would need this
        same failure path, and do not call log_message() from here, it would recurse.
     */
+    unsigned long publishStart = millis();
     if (!mqtt_client.publish(log_topic, log_line)) {
-      mqttPublishFails++;
+      recordPublishFail(log_topic, strlen(log_topic) + strlen(log_line), millis() - publishStart);
       if (heishamonSettings.logSerial1) {
         loggingSerial.print(millis());
         loggingSerial.print(F(": "));
@@ -668,6 +673,21 @@ void logHex(char *hex, byte hex_len) {
   }
 }
 
+/* Keep what the last failed publish looked like. A fail that took about the client write
+   timeout means the link stalled and no acks came back; one that failed straight away means
+   something else. The size shows whether fails cluster on large payloads.
+*/
+void recordPublishFail(const char* topic, unsigned int bytes, unsigned long took) {
+  mqttPublishFails++;
+  if (took >= 1000) mqttPublishStalls++;
+  lastPublishFailMs = took;
+  lastPublishFailBytes = bytes;
+  //drop the base topic, it is the same for every publish
+  size_t baseLen = strlen(heishamonSettings.mqtt_topic_base);
+  if ((strncmp(topic, heishamonSettings.mqtt_topic_base, baseLen) == 0) && (topic[baseLen] == '/')) topic += baseLen + 1;
+  strlcpy(lastPublishFailTopic, topic, sizeof(lastPublishFailTopic));
+}
+
 /* PubSubClient writes each packet with a single client write and returns false when that
    write came up short. By then part of the packet is already on the wire, and mqtt has no
    way to resynchronise a byte stream: the broker reads our next topic text as a fixed
@@ -675,12 +695,13 @@ void logHex(char *hex, byte hex_len) {
    ourselves and let the loop reconnect, which is the only thing that restores framing.
 */
 bool mqttPublishChecked(PubSubClient &client, const char* topic, const char* payload, bool retain) {
+  unsigned long start = millis();
   if (client.publish(topic, payload, retain)) return true;
   /* Once we have dropped the connection the rest of a publish burst fails too, and those are
      expected, so do not count them or disconnect again.
   */
   if (!client.connected()) return false;
-  mqttPublishFails++;
+  recordPublishFail(topic, strlen(topic) + strlen(payload), millis() - start);
   /* publish() also returns false when the message does not fit the buffer, but that is
      rejected before anything is written so the stream is still intact and reconnecting would
      not help. Only a short write truncates a packet, and only that needs a resync.
@@ -2163,6 +2184,17 @@ void publishDiagnostics() {
 #else
   diag += ESP.getMinFreeHeap();
 #endif
+  diag += F(",\"mqtt publish fails\":");
+  diag += mqttPublishFails;
+  diag += F(",\"mqtt publish stalls\":");
+  diag += mqttPublishStalls;
+  diag += F(",\"last publish fail ms\":");
+  diag += lastPublishFailMs;
+  diag += F(",\"last publish fail bytes\":");
+  diag += lastPublishFailBytes;
+  diag += F(",\"last publish fail topic\":\"");
+  diag += lastPublishFailTopic;
+  diag += F("\"");
   diag += F("}");
   sprintf_P(mqtt_topic, PSTR("%s/diagnostics"), heishamonSettings.mqtt_topic_base);
   mqttPublishChecked(mqtt_client, mqtt_topic, diag.c_str(), MQTT_RETAIN_VALUES);
@@ -2309,6 +2341,13 @@ void loop() {
     if (mqttPublishFails > 0) { //only when it actually happens, so normal output is unchanged
       message += F(" ## Mqtt publish fails: ");
       message += mqttPublishFails;
+      message += F(" (last ");
+      message += lastPublishFailMs;
+      message += F(" ms, ");
+      message += lastPublishFailBytes;
+      message += F(" bytes, ");
+      message += lastPublishFailTopic;
+      message += F(")");
     }
     /* Only after a crash, so a normal boot leaves this line unchanged. It has to be here and
        not only in the stats topic: on a bad link mqtt is the thing that is down, and the web
