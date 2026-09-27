@@ -126,6 +126,42 @@ char mqtt_topic[256];
 static int mqttReconnects = 0;
 unsigned int mqttPublishFails = 0; //publishes that returned false, meaning a short write truncated the packet
 
+/* why the last boot happened. Kept for the whole run and reported in the stats topic,
+   because a crash on a remote device is otherwise invisible without a serial capture.
+*/
+const char *resetReason = "unknown";
+bool resetWasCrash = false; //watchdog, exception or brownout, as opposed to a normal or deliberate boot
+
+const char *getResetReason() {
+#if defined(ESP8266)
+  /* getResetReason() returns an Arduino String built from a flash literal, so keep our own
+     stable pointer instead of holding on to its buffer.
+  */
+  switch (ESP.getResetInfoPtr()->reason) {
+    case REASON_DEFAULT_RST:      return "power on";
+    case REASON_EXT_SYS_RST:      return "external reset";
+    case REASON_SOFT_RESTART:     return "software restart";
+    case REASON_DEEP_SLEEP_AWAKE: return "deep sleep wake";
+    case REASON_WDT_RST:          resetWasCrash = true; return "hardware watchdog";
+    case REASON_EXCEPTION_RST:    resetWasCrash = true; return "exception";
+    case REASON_SOFT_WDT_RST:     resetWasCrash = true; return "software watchdog";
+    default:                      return "unknown";
+  }
+#else
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:  return "power on";
+    case ESP_RST_EXT:      return "external reset";
+    case ESP_RST_SW:       return "software restart";
+    case ESP_RST_PANIC:    resetWasCrash = true; return "exception";
+    case ESP_RST_INT_WDT:  resetWasCrash = true; return "interrupt watchdog";
+    case ESP_RST_TASK_WDT: resetWasCrash = true; return "task watchdog";
+    case ESP_RST_WDT:      resetWasCrash = true; return "other watchdog";
+    case ESP_RST_BROWNOUT: resetWasCrash = true; return "brownout";
+    default:               return "unknown";
+  }
+#endif
+}
+
 // state for restoring known 1wire sensors from mqtt retained messages just after boot
 bool dallasMqttRestorePending = false;
 unsigned long dallasMqttRestoreStart = 0;
@@ -1873,6 +1909,11 @@ void setup() {
   loggingSerial.println();
   loggingSerial.println(F("--- HEISHAMON ---"));
   loggingSerial.println(F("starting..."));
+  /* grab this before anything else can reset it. A watchdog or exception here is the only
+     clue that a remote unit is crashing rather than losing its network. The numeric code is
+     already printed to the logging serial further down, before the rules are loaded.
+  */
+  resetReason = getResetReason();
 
   //first boot check, to visually confirm good flash
   //this also formats the littlefs if necessary
@@ -2209,6 +2250,14 @@ void loop() {
       message += F(" ## Mqtt publish fails: ");
       message += mqttPublishFails;
     }
+    /* Only after a crash, so a normal boot leaves this line unchanged. It has to be here and
+       not only in the stats topic: on a bad link mqtt is the thing that is down, and the web
+       console is where most people look.
+    */
+    if (resetWasCrash) {
+      message += F(" ## Last reset: ");
+      message += resetReason;
+    }
     log_message((char*)message.c_str());
 
     String stats;
@@ -2245,7 +2294,9 @@ void loop() {
     stats += toolongread;
     stats += F(",\"timeout reads\":");
     stats += timeoutread;
-    stats += F(",\"version\":\"");
+    stats += F(",\"reset reason\":\"");
+    stats += resetReason;
+    stats += F("\",\"version\":\"");
     stats += heishamon_version;
     stats += F("\",\"board\":\"");
 #ifdef ESP8266
