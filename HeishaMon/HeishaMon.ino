@@ -129,6 +129,11 @@ unsigned int mqttPublishStalls = 0; //of those, the ones where the write waited 
 unsigned long lastPublishFailMs = 0; //how long the last failed publish took
 unsigned int lastPublishFailBytes = 0;
 char lastPublishFailTopic[64] = "";
+unsigned int mqttConnectFails = 0;   //connect attempts that did not get a connack, reconnects only counts the ones that did
+int8_t mqttLastConnectState = 0;     //PubSubClient state() of the last failed connect
+unsigned long mqttDownSince = 0;     //millis() when the connection was lost, 0 while connected
+unsigned long mqttOfflineSeconds = 0;
+unsigned long mqttLongestOfflineSeconds = 0;
 
 /* why the last boot happened. Kept for the whole run and reported in the stats topic,
    because a crash on a remote device is otherwise invisible without a serial capture.
@@ -589,6 +594,8 @@ void mqtt_reconnect()
 //#ifdef TLS_SUPPORT // error state is useful in any case
     else {
       int8_t err = mqtt_client.state();
+      mqttConnectFails++;
+      mqttLastConnectState = err;
       log_message(_F("MQTT connect failed, state:"));
       switch (err) {
         case -1: log_message(_F(" -1 → TLS handshake or network error")); break;
@@ -2165,6 +2172,22 @@ void trackLoopTime() {
 #endif
 }
 
+/* The reconnect counter says how often the connection dropped, not for how long. With the 30s
+   reconnect timer each drop costs anything from a few seconds to minutes of missing data.
+*/
+void trackMqttOffline() {
+  if (mqtt_client.connected()) {
+    if (mqttDownSince != 0) {
+      unsigned long secs = (millis() - mqttDownSince + 500) / 1000;
+      mqttOfflineSeconds += secs;
+      if (secs > mqttLongestOfflineSeconds) mqttLongestOfflineSeconds = secs;
+      mqttDownSince = 0;
+    }
+  } else if ((mqttDownSince == 0) && (mqttReconnects > 0)) { //waiting for the first connect after boot is not an outage
+    mqttDownSince = millis();
+  }
+}
+
 void publishDiagnostics() {
   String diag;
 #ifdef ESP8266
@@ -2194,7 +2217,14 @@ void publishDiagnostics() {
   diag += lastPublishFailBytes;
   diag += F(",\"last publish fail topic\":\"");
   diag += lastPublishFailTopic;
-  diag += F("\"");
+  diag += F("\",\"mqtt connect fails\":");
+  diag += mqttConnectFails;
+  diag += F(",\"mqtt connect state\":");
+  diag += mqttLastConnectState;
+  diag += F(",\"mqtt offline s\":");
+  diag += mqttOfflineSeconds;
+  diag += F(",\"mqtt longest offline s\":");
+  diag += mqttLongestOfflineSeconds;
   diag += F("}");
   sprintf_P(mqtt_topic, PSTR("%s/diagnostics"), heishamonSettings.mqtt_topic_base);
   mqttPublishChecked(mqtt_client, mqtt_topic, diag.c_str(), MQTT_RETAIN_VALUES);
@@ -2217,6 +2247,7 @@ void loop() {
   ArduinoOTA.handle();
 
   mqtt_client.loop();
+  trackMqttOffline();
 
   if (heishamonSettings.opentherm) {
     HeishaOTLoop(actData, mqtt_client, heishamonSettings.mqtt_topic_base);
@@ -2356,6 +2387,20 @@ void loop() {
     if (resetWasCrash) {
       message += F(" ## Last reset: ");
       message += resetReason;
+    }
+    if (mqttConnectFails > 0) {
+      message += F(" ## Mqtt connect fails: ");
+      message += mqttConnectFails;
+      message += F(" (last state ");
+      message += mqttLastConnectState;
+      message += F(")");
+    }
+    if (mqttOfflineSeconds > 0) {
+      message += F(" ## Mqtt offline: ");
+      message += mqttOfflineSeconds;
+      message += F(" s (longest ");
+      message += mqttLongestOfflineSeconds;
+      message += F(" s)");
     }
     if (loopMaxInterval >= 100) { //only when the loop was slow in this interval
       message += F(" ## Longest loop: ");
