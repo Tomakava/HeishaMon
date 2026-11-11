@@ -908,7 +908,27 @@ void pushCommandBuffer(byte* command, int length) {
   cmdnrel++;
 }
 
+/* Anything in the rx buffer before we send is a late or partial answer to an earlier
+   query, never the answer to this one. Only call while not sending. */
+int flushHeatpumpRx() {
+  int stale = 0;
+  while (heatpumpSerial.available()) {
+    heatpumpSerial.read();
+    stale++;
+  }
+  return stale;
+}
+
 #ifdef ESP32
+//esp32 tx task may not call log_message itself, so log through logQueue
+static void flushHeatpumpRxLogged(char *local_log_msg) {
+  int stale = flushHeatpumpRx();
+  if (stale > 0) {
+    sprintf_P(local_log_msg, PSTR("Discarded %d stale bytes before sending (previous answer arrived too late)"), stale);
+    xQueueSend(logQueue, local_log_msg, 0);
+  }
+}
+
 void serialTXTask(void *pvParameters) {
   unsigned long lastPCBSendTime = 0;
   unsigned long lastHPSendTime = 0;
@@ -931,6 +951,7 @@ void serialTXTask(void *pvParameters) {
     if ((!sending) && ((unsigned long)(now - lastPCBSendTime) >= OPTIONALPCBQUERYTIME)) {
       lastPCBSendTime = now;
       if (heishamonSettings.optionalPCB && !heishamonSettings.listenonly) {
+        flushHeatpumpRxLogged(local_log_msg);
         sending = true;
         sendCommandReadTime = now;
         xQueuePeek(pcbQueue, localPCBQuery, 0);
@@ -950,6 +971,7 @@ void serialTXTask(void *pvParameters) {
     // second priority: static heatpump query every waitTime seconds
     if ((!sending) && (!heishamonSettings.listenonly)) {
       if ((unsigned long)(now - lastHPSendTime) >= (1000 * heishamonSettings.waitTime)) {
+        flushHeatpumpRxLogged(local_log_msg);
         sending = true;
         sendCommandReadTime = now;
         lastHPSendTime = now;
@@ -965,6 +987,7 @@ void serialTXTask(void *pvParameters) {
     if ((!sending) && (!heishamonSettings.listenonly) && extraDataBlockAvailable) {
       if ((unsigned long)(now - lastHPExtraSendTime) >= (1000 * heishamonSettings.waitTime)) {
         lastHPExtraSendTime = now;
+        flushHeatpumpRxLogged(local_log_msg);
         sending = true;
         sendCommandReadTime = now;
         panasonicQuery[3] = 0x21;
@@ -980,6 +1003,7 @@ void serialTXTask(void *pvParameters) {
     if ((!sending) && (!heishamonSettings.listenonly)) {
       struct cmdbuffer_t cmd;
       if (xQueueReceive(cmdQueue, &cmd, 0) == pdTRUE) {
+        flushHeatpumpRxLogged(local_log_msg);
         sending = true;
         sendCommandReadTime = now;
         byte chk = calcChecksum(cmd.data, cmd.length);
@@ -1027,6 +1051,13 @@ bool send_command(byte* command, int length) {
     pushCommandBuffer(command, length);
     return false;
   }
+
+  int stale = flushHeatpumpRx();
+  if (stale > 0) {
+    sprintf_P(log_msg, PSTR("Discarded %d stale bytes before sending (previous answer arrived too late)"), stale);
+    log_message(log_msg);
+  }
+
   sending = true; //simple semaphore to only allow one send command at a time, semaphore ends when answered data is received
 
   byte chk = calcChecksum(command, length);
@@ -2168,6 +2199,8 @@ void send_optionalpcb_query() {
 #endif
 
 void readHeatpump() {
+  //read first: if loop() was blocked past SERIALTIMEOUT the full answer may already be buffered
+  if ( (heishamonSettings.listenonly || sending) && (heatpumpSerial.available() > 0)) readSerial();
   if (sending && ((unsigned long)(millis() - sendCommandReadTime) > SERIALTIMEOUT)) {
     log_message(_F("Previous read data attempt failed due to timeout!"));
     sprintf_P(log_msg, PSTR("Received %d bytes data"), data_length);
@@ -2182,7 +2215,6 @@ void readHeatpump() {
     data_length = 0; //clear any data in array
     sending = false; //receiving the answer from the send command timed out, so we are allowed to send a new command
   }
-  if ( (heishamonSettings.listenonly || sending) && (heatpumpSerial.available() > 0)) readSerial();
 }
 
 void checkBootButton() {
