@@ -1948,7 +1948,12 @@ static int webserver_process_send(struct webserver_t *client) {
   return i;
 }
 
-void webserver_send_content_P(struct webserver_t *client, PGM_P buf, uint16_t size) {
+/*
+ * Append ptr to the client's send list. type 1 is a PROGMEM pointer, type 0 a heap
+ * buffer the send list frees once sent. Out of memory drops the data instead of
+ * restarting: losing one console line or one response beats rebooting the device.
+ */
+static int8_t webserver_queue(struct webserver_t *client, void *ptr, uint16_t size, uint8_t type) {
   struct sendlist_t *node = NULL;
 
 #if WEBSERVER_MAX_SENDLIST == 0
@@ -1956,10 +1961,9 @@ void webserver_send_content_P(struct webserver_t *client, PGM_P buf, uint16_t si
   /*LCOV_EXCL_START*/
   if(node == NULL) {
   #if defined(ESP8266) || defined(ESP32)
-    loggingSerial.printf("Out of memory %s:#%d\n", __FUNCTION__, __LINE__);
-    ESP.restart();
-    exit(-1);
+    loggingSerial.printf("Out of memory %s:#%d, dropping %u bytes\n", __FUNCTION__, __LINE__, size);
   #endif
+    return -1;
   }
 #else
   uint8_t i = 0;
@@ -1975,15 +1979,15 @@ void webserver_send_content_P(struct webserver_t *client, PGM_P buf, uint16_t si
   #else
     printf("Sendlist queue is full\n");
   #endif
-    return;
+    return -1;
   }
 #endif
 
   /*LCOV_EXCL_STOP*/
   memset(node, 0, sizeof(struct sendlist_t));
-  node->data.ptr = (void *)buf;
+  node->data.ptr = ptr;
   node->size = size;
-  node->type = 1;
+  node->type = type;
 
 #if WEBSERVER_MAX_SENDLIST == 0
   if(client->sendlist == NULL) {
@@ -1994,60 +1998,29 @@ void webserver_send_content_P(struct webserver_t *client, PGM_P buf, uint16_t si
     client->sendlist_head = node;
   }
 #endif
+  return 0;
 }
 
-void webserver_send_content(struct webserver_t *client, char *buf, uint16_t size) {
-  struct sendlist_t *node = NULL;
+int8_t webserver_send_content_P(struct webserver_t *client, PGM_P buf, uint16_t size) {
+  return webserver_queue(client, (void *)buf, size, 1);
+}
 
-#if WEBSERVER_MAX_SENDLIST == 0
-  node = (struct sendlist_t *)malloc(sizeof(struct sendlist_t));
+int8_t webserver_send_content(struct webserver_t *client, char *buf, uint16_t size) {
+  void *copy = malloc(size+1);
   /*LCOV_EXCL_START*/
-  if(node == NULL) {
+  if(copy == NULL) {
   #if defined(ESP8266) || defined(ESP32)
-    loggingSerial.printf("Out of memory %s:#%d\n", __FUNCTION__, __LINE__);
-    ESP.restart();
-    exit(-1);
+    loggingSerial.printf("Out of memory %s:#%d, dropping %u bytes\n", __FUNCTION__, __LINE__, size);
   #endif
+    return -1;
   }
-#else
-  uint8_t i = 0;
-  for(i=0;i<WEBSERVER_MAX_SENDLIST;i++) {
-    if(client->sendlist[i].data.ptr == NULL) {
-      node = &client->sendlist[i];
-      break;
-    }
+  /*LCOV_EXCL_STOP*/
+  memcpy(copy, buf, size);
+  if(webserver_queue(client, copy, size, 0) != 0) {
+    free(copy);
+    return -1;
   }
-  if(node == NULL) {
-  #if defined(ESP8266) || defined(ESP32)
-    loggingSerial.printf("Sendlist queue is full\n");
-  #else
-    printf("Sendlist queue is full\n");
-  #endif
-    return;
-  }
-#endif
-  memset(node, 0, sizeof(struct sendlist_t));
-  if((node->data.ptr = malloc(size+1)) == NULL) {
-  #if defined(ESP8266) || defined(ESP32)
-    loggingSerial.printf("Out of memory %s:#%d\n", __FUNCTION__, __LINE__);
-    ESP.restart();
-    exit(-1);
-  #endif
-  }
-  memcpy(node->data.ptr, buf, size);
-
-  node->size = size;
-  node->type = 0;
-
-#if WEBSERVER_MAX_SENDLIST == 0
-  if(client->sendlist == NULL) {
-    client->sendlist = node;
-    client->sendlist_head = node;
-  } else {
-    client->sendlist_head->next = node;
-    client->sendlist_head = node;
-  }
-#endif
+  return 0;
 }
 
 int8_t webserver_send(struct webserver_t *client, uint16_t code, char *mimetype, uint16_t data_len) {
@@ -2212,16 +2185,79 @@ static void send_websocket_handshake(struct webserver_t *client, const char *key
   }
 }
 
-void websocket_write_P(struct webserver_t *client, PGM_P data, uint16_t data_len) {
-  websocket_send_header(client, WEBSOCKET_OPCODE_TEXT, data_len);
-  webserver_send_content_P(client, data, data_len);
+static uint8_t websocket_frame_header(unsigned char *copy, uint8_t opcode, uint16_t data_len) {
+  uint8_t index = 2;
+  memset(copy, 0, 4);
+
+  copy[0] = 0x80 + (opcode & 0x0f);
+  if(data_len <= 125) {
+    copy[1] = data_len;
+  } else if(data_len < 65535) {
+    copy[1] = 126;
+    copy[2] = (data_len >> 8) & 255;
+    copy[3] = (data_len) & 255;
+    index = 4;
+  }
+  // larger frames (64 bit length) are not supported
+  return index;
+}
+
+/*
+ * Queue header and payload as one buffer, so a message is either queued whole or
+ * not at all; a header without its payload would corrupt the stream. A client that
+ * reads slower than we log would otherwise grow its queue until the heap runs out,
+ * so refuse to queue when that would leave less than WEBSOCKET_MIN_FREE_HEAP.
+ */
+static int8_t websocket_queue_frame(struct webserver_t *client, const char *data, uint16_t data_len, uint8_t progmem) {
+  unsigned char header[4];
+  uint8_t index = websocket_frame_header(header, WEBSOCKET_OPCODE_TEXT, data_len);
+  uint32_t size = (uint32_t)index + data_len;
+#if defined(ESP8266) || defined(ESP32)
+  if(ESP.getFreeHeap() < size + WEBSOCKET_MIN_FREE_HEAP) {
+    return -1;
+  }
+#endif
+  char *frame = (char *)malloc(size);
+  if(frame == NULL) {
+    return -1;
+  }
+  memcpy(frame, header, index);
+  if(progmem == 1) {
+    memcpy_P(&frame[index], data, data_len);
+  } else {
+    memcpy(&frame[index], data, data_len);
+  }
+  if(webserver_queue(client, frame, size, 0) != 0) {
+    free(frame);
+    return -1;
+  }
   client->step = WEBSERVER_CLIENT_SENDING;
+  return 0;
+}
+
+static void websocket_queue_message(struct webserver_t *client, const char *data, uint16_t data_len, uint8_t progmem) {
+  if(client->ws_dropped > 0) {
+    char note[96];
+    int len = snprintf_P(note, sizeof(note),
+      PSTR("{\"logMsg\":\"... %u console messages dropped, not enough free memory to queue them ...\"}"),
+      client->ws_dropped);
+    if(len <= 0 || len >= (int)sizeof(note) || websocket_queue_frame(client, note, len, 0) != 0) {
+      if(client->ws_dropped < 0xFFFF) client->ws_dropped++;
+      return;
+    }
+    client->ws_dropped = 0;
+  }
+  if(websocket_queue_frame(client, data, data_len, progmem) != 0) {
+    if(client->ws_dropped < 0xFFFF) client->ws_dropped++;
+  }
+}
+
+void websocket_write_P(struct webserver_t *client, PGM_P data, uint16_t data_len) {
+  websocket_queue_message(client, (const char *)data, data_len, 1);
 }
 
 void websocket_write(struct webserver_t *client, char *data, uint16_t data_len) {
-  websocket_send_header(client, WEBSOCKET_OPCODE_TEXT, data_len);
-  webserver_send_content(client, (char *)data, data_len);
-  client->step = WEBSERVER_CLIENT_SENDING;
+  websocket_queue_message(client, data, data_len, 0);
 }
 
 void websocket_write_all(char *data, uint16_t data_len) {
@@ -2243,35 +2279,8 @@ void websocket_write_all_P(PGM_P data, uint16_t data_len) {
 }
 
 void websocket_send_header(struct webserver_t *client, uint8_t opcode, uint16_t data_len) {
-  unsigned char copy[10];
-  int index = 2;
-  memset(&copy, 0, 10);
-
-  copy[0] = 0x80 + (opcode & 0x0f);
-  if(data_len <= 125) {
-    copy[1] = data_len;
-  } else if(data_len < 65535) {
-    copy[1] = 126;
-    copy[2] = (data_len >> 8) & 255;
-    copy[3] = (data_len) & 255;
-    index = 4;
-  } else {
-    /**
-     * Size too big for ESP8266
-     */
-    /*
-      copy[1] = 127;
-      copy[2] = (data_len >> 56) & 255;
-      copy[3] = (data_len >> 48) & 255;
-      copy[4] = (data_len >> 40) & 255;
-      copy[5] = (data_len >> 32) & 255;
-      copy[6] = (data_len >> 24) & 255;
-      copy[7] = (data_len >> 16) & 255;
-      copy[8] = (data_len >> 8) & 255;
-      copy[9] = (data_len) & 255;
-      index = 10;
-     */
-  }
+  unsigned char copy[4];
+  uint8_t index = websocket_frame_header(copy, opcode, data_len);
   webserver_send_content(client, (char *)copy, index);
 }
 
@@ -2515,6 +2524,7 @@ void webserver_reset_client(struct webserver_t *client) {
   client->lastping = 0;
   client->content = 0;
   client->is_websocket = 0;
+  client->ws_dropped = 0;
   client->userdata = NULL;
 
   struct sendlist_t *tmp = NULL;
@@ -2690,7 +2700,20 @@ void webserver_loop(void) {
         }
       } break;
       case WEBSERVER_CLIENT_SENDING: {
+#if defined(ESP8266)
+        /*
+         * Only write what the socket can take now. With a full send buffer
+         * safe_write() waits up to 1 s and WiFiClient::write() then waits for acks
+         * up to its 5 s timeout, stalling loop() on every slow or lossy client.
+         */
+        size_t room = clients[i].data.client->availableForWrite();
+        if(room < 64) {
+          break;
+        }
+        clients[i].data.totallen = (room < MTU_SIZE) ? room : MTU_SIZE;
+#else
         clients[i].data.totallen = MTU_SIZE;
+#endif
         /*
          * Leave room for chunk overhead
          */

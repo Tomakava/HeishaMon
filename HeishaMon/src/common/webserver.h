@@ -41,6 +41,11 @@
   #define WEBSERVER_CLIENT_PING_INTERVAL 3000
 #endif
 
+// websocket messages are dropped rather than queued below this much free heap
+#ifndef WEBSOCKET_MIN_FREE_HEAP
+  #define WEBSOCKET_MIN_FREE_HEAP 8192
+#endif
+
 #ifndef __linux__
   #include <Arduino.h>
   #include "lwip/opt.h"
@@ -131,6 +136,7 @@ typedef struct webserver_t {
   uint32_t totallen;
   uint32_t readlen;
   uint16_t content;
+  uint16_t ws_dropped; // websocket messages dropped since the last one that got through
   uint8_t route;
 #if WEBSERVER_MAX_SENDLIST == 0
   struct sendlist_t *sendlist;
@@ -182,8 +188,8 @@ void websocket_write_all(char *data, uint16_t data_len);
 void websocket_write_P(struct webserver_t *client, PGM_P data, uint16_t data_len);
 void websocket_write(struct webserver_t *client, char *data, uint16_t data_len);
 void websocket_send_header(struct webserver_t *client, uint8_t opcode, uint16_t data_len);
-void webserver_send_content(struct webserver_t *client, char *buf, uint16_t len);
-void webserver_send_content_P(struct webserver_t *client, PGM_P buf, uint16_t len);
+int8_t webserver_send_content(struct webserver_t *client, char *buf, uint16_t len);
+int8_t webserver_send_content_P(struct webserver_t *client, PGM_P buf, uint16_t len);
 err_t webserver_async_receive(void *arg, tcp_pcb *pcb, struct pbuf *data, err_t err);
 uint8_t webserver_sync_receive(struct webserver_t *client, uint8_t *rbuffer, uint16_t size);
 void webserver_loop(void);

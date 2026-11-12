@@ -711,6 +711,12 @@ void log_message(char* string)
   strftime(timestring, 32, "%c", timeinfo);
   size_t len = strlen(string) + strlen(timestring) + 32; //+32 long enough to contain millis() and the json part later for websocket mesg
   char* log_line = (char *) malloc(len);
+  if (log_line == NULL) { //out of memory: losing this line beats crashing on it
+#ifdef ESP32
+    if (!inSetup) blinkNeoPixel(false);
+#endif
+    return;
+  }
   snprintf(log_line, len, "%s (%lu): %s", timestring, millis(), string);
 
   if (heishamonSettings.logSerial1) {
@@ -735,7 +741,7 @@ void log_message(char* string)
     }
   }
   //send log message to websocket
-  snprintf(log_line, len+12, "{\"logMsg\":\"%s (%lu): %s\"}", timestring, millis(), string);
+  snprintf(log_line, len, "{\"logMsg\":\"%s (%lu): %s\"}", timestring, millis(), string);
   websocket_write_all(log_line, strlen(log_line));
   free(log_line);
 #ifdef ESP32
