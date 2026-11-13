@@ -1566,8 +1566,13 @@ static uint16_t webserver_create_header(struct webserver_t *client, uint16_t cod
 static int webserver_process_send(struct webserver_t *client) {
   struct sendlist_t *tmp = NULL;
   uint16_t cpylen = client->totallen, i = 0, cpyptr = client->ptr;
-  unsigned char cpy[client->totallen+1];
-  memset(&cpy, 0, client->totallen+1);
+  uint16_t out = 0;
+  /*
+   * Sync clients: collect the whole pass, chunk framing included, in cpy and write it
+   * once, so it leaves as a few full packets instead of one small packet per piece.
+   */
+  unsigned char cpy[client->totallen+16];
+  memset(&cpy, 0, client->totallen+16);
 
 #if WEBSERVER_MAX_SENDLIST == 0
   tmp = client->sendlist;
@@ -1631,14 +1636,8 @@ static int webserver_process_send(struct webserver_t *client) {
     if(client->async == 1) {
       tcp_write(client->pcb, chunk_size, n, TCP_WRITE_FLAG_COPY);
     } else {
-      if(safe_write(client,chunk_size, n) > 0) {
-        if(client->is_websocket == 0) {
-          client->lastseen = millis();
-        }
-      }
-      // Abort this response immediately if the TCP client stalled or accepted
-      // only part of the requested bytes. Cleanup happens on the next pass.
-      if(client->step == WEBSERVER_CLIENT_CLOSE) return -1;
+      memcpy(&cpy[out], chunk_size, n);
+      out += n;
     }
     i += n;
   }
@@ -1662,35 +1661,22 @@ static int webserver_process_send(struct webserver_t *client) {
 #if (!defined(NON32XFER_HANDLER) && defined(MMU_SEC_HEAP))
             uint16_t x = 0;
             for(x=0;x<tmp->size;x++) {
-              cpy[x] = pgm_read_byte(&((PGM_P)tmp->data.ptr)[client->ptr+x]);
+              cpy[out+x] = pgm_read_byte(&((PGM_P)tmp->data.ptr)[client->ptr+x]);
             }
 #else
-             memcpy_P(cpy, &((PGM_P)tmp->data.ptr)[client->ptr], tmp->size);
+             memcpy_P(&cpy[out], &((PGM_P)tmp->data.ptr)[client->ptr], tmp->size);
 #endif
             if(client->async == 1) {
               tcp_write(client->pcb, cpy, tmp->size, TCP_WRITE_FLAG_COPY | TCP_WRITE_FLAG_MORE);
             } else {
-              if(safe_write(client,cpy, tmp->size) > 0) {
-                if(client->is_websocket == 0) {
-                  client->lastseen = millis();
-                }
-              }
-      // Abort this response immediately if the TCP client stalled or accepted
-      // only part of the requested bytes. Cleanup happens on the next pass.
-      if(client->step == WEBSERVER_CLIENT_CLOSE) return -1;
+              out += tmp->size;
             }
           } else {
             if(client->async == 1) {
               tcp_write(client->pcb, &((unsigned char *)tmp->data.ptr)[client->ptr], tmp->size, TCP_WRITE_FLAG_COPY | TCP_WRITE_FLAG_MORE);
             } else {
-              if(safe_write(client,&((unsigned char *)tmp->data.ptr)[client->ptr], tmp->size) > 0) {
-                if(client->is_websocket == 0) {
-                  client->lastseen = millis();
-                }
-              }
-      // Abort this response immediately if the TCP client stalled or accepted
-      // only part of the requested bytes. Cleanup happens on the next pass.
-      if(client->step == WEBSERVER_CLIENT_CLOSE) return -1;
+              memcpy(&cpy[out], &((unsigned char *)tmp->data.ptr)[client->ptr], tmp->size);
+              out += tmp->size;
             }
           }
           i += tmp->size;
@@ -1722,35 +1708,22 @@ static int webserver_process_send(struct webserver_t *client) {
 #if (!defined(NON32XFER_HANDLER) && defined(MMU_SEC_HEAP))
             uint16_t x = 0;
             for(x=0;x<client->totallen;x++) {
-              cpy[x] = pgm_read_byte(&((PGM_P)tmp->data.ptr)[client->ptr+x]);
+              cpy[out+x] = pgm_read_byte(&((PGM_P)tmp->data.ptr)[client->ptr+x]);
             }
 #else
-             memcpy_P(cpy, &((PGM_P)tmp->data.ptr)[client->ptr], client->totallen);
+             memcpy_P(&cpy[out], &((PGM_P)tmp->data.ptr)[client->ptr], client->totallen);
 #endif
             if(client->async == 1) {
               tcp_write(client->pcb, cpy, client->totallen, TCP_WRITE_FLAG_COPY | TCP_WRITE_FLAG_MORE);
             } else {
-              if(safe_write(client,cpy, client->totallen) > 0) {
-                if(client->is_websocket == 0) {
-                  client->lastseen = millis();
-                }
-              }
-      // Abort this response immediately if the TCP client stalled or accepted
-      // only part of the requested bytes. Cleanup happens on the next pass.
-      if(client->step == WEBSERVER_CLIENT_CLOSE) return -1;
+              out += client->totallen;
             }
           } else {
             if(client->async == 1) {
               tcp_write(client->pcb, &((unsigned char *)tmp->data.ptr)[client->ptr], client->totallen, TCP_WRITE_FLAG_COPY | TCP_WRITE_FLAG_MORE);
             } else {
-              if(safe_write(client,&((unsigned char *)tmp->data.ptr)[client->ptr], client->totallen) > 0) {
-                if(client->is_websocket == 0) {
-                  client->lastseen = millis();
-                }
-              }
-      // Abort this response immediately if the TCP client stalled or accepted
-      // only part of the requested bytes. Cleanup happens on the next pass.
-      if(client->step == WEBSERVER_CLIENT_CLOSE) return -1;
+              memcpy(&cpy[out], &((unsigned char *)tmp->data.ptr)[client->ptr], client->totallen);
+              out += client->totallen;
             }
           }
           i += client->totallen;
@@ -1762,35 +1735,22 @@ static int webserver_process_send(struct webserver_t *client) {
 #if (!defined(NON32XFER_HANDLER) && defined(MMU_SEC_HEAP))
           uint16_t x = 0;
           for(x=0;x<(tmp->size-client->ptr);x++) {
-            cpy[x] = pgm_read_byte(&((PGM_P)tmp->data.ptr)[client->ptr+x]);
+            cpy[out+x] = pgm_read_byte(&((PGM_P)tmp->data.ptr)[client->ptr+x]);
           }
 #else
-           memcpy_P(cpy, &((PGM_P)tmp->data.ptr)[client->ptr], (tmp->size-client->ptr));
+           memcpy_P(&cpy[out], &((PGM_P)tmp->data.ptr)[client->ptr], (tmp->size-client->ptr));
 #endif
           if(client->async == 1) {
             tcp_write(client->pcb, cpy, (tmp->size-client->ptr), TCP_WRITE_FLAG_COPY | TCP_WRITE_FLAG_MORE);
           } else {
-            if(safe_write(client,cpy, (tmp->size-client->ptr)) > 0) {
-              if(client->is_websocket == 0) {
-                client->lastseen = millis();
-              }
-            }
-      // Abort this response immediately if the TCP client stalled or accepted
-      // only part of the requested bytes. Cleanup happens on the next pass.
-      if(client->step == WEBSERVER_CLIENT_CLOSE) return -1;
+            out += (tmp->size-client->ptr);
           }
         } else {
           if(client->async == 1) {
             tcp_write(client->pcb, &((unsigned char *)tmp->data.ptr)[client->ptr], (tmp->size-client->ptr), TCP_WRITE_FLAG_COPY | TCP_WRITE_FLAG_MORE);
           } else {
-            if(safe_write(client,&((unsigned char *)tmp->data.ptr)[client->ptr], (tmp->size-client->ptr)) > 0) {
-              if(client->is_websocket == 0) {
-                client->lastseen = millis();
-              }
-            }
-      // Abort this response immediately if the TCP client stalled or accepted
-      // only part of the requested bytes. Cleanup happens on the next pass.
-      if(client->step == WEBSERVER_CLIENT_CLOSE) return -1;
+            memcpy(&cpy[out], &((unsigned char *)tmp->data.ptr)[client->ptr], (tmp->size-client->ptr));
+            out += (tmp->size-client->ptr);
           }
         }
         i += (tmp->size-client->ptr);
@@ -1821,35 +1781,22 @@ static int webserver_process_send(struct webserver_t *client) {
 #if (!defined(NON32XFER_HANDLER) && defined(MMU_SEC_HEAP))
           uint16_t x = 0;
           for(x=0;x<client->totallen;x++) {
-            cpy[x] = pgm_read_byte(&((PGM_P)tmp->data.ptr)[client->ptr+x]);
+            cpy[out+x] = pgm_read_byte(&((PGM_P)tmp->data.ptr)[client->ptr+x]);
           }
 #else
-           memcpy_P(cpy, &((PGM_P)tmp->data.ptr)[client->ptr], client->totallen);
+           memcpy_P(&cpy[out], &((PGM_P)tmp->data.ptr)[client->ptr], client->totallen);
 #endif
           if(client->async == 1) {
             tcp_write(client->pcb, cpy, client->totallen, TCP_WRITE_FLAG_COPY | TCP_WRITE_FLAG_MORE);
           } else {
-            if(safe_write(client,cpy, client->totallen) > 0) {
-              if(client->is_websocket == 0) {
-                client->lastseen = millis();
-              }
-            }
-      // Abort this response immediately if the TCP client stalled or accepted
-      // only part of the requested bytes. Cleanup happens on the next pass.
-      if(client->step == WEBSERVER_CLIENT_CLOSE) return -1;
+            out += client->totallen;
           }
         } else {
           if(client->async == 1) {
             tcp_write(client->pcb, &((unsigned char *)tmp->data.ptr)[client->ptr], client->totallen, TCP_WRITE_FLAG_COPY | TCP_WRITE_FLAG_MORE);
           } else {
-            if(safe_write(client,&((unsigned char *)tmp->data.ptr)[client->ptr], client->totallen) > 0) {
-              if(client->is_websocket == 0) {
-                client->lastseen = millis();
-              }
-            }
-      // Abort this response immediately if the TCP client stalled or accepted
-      // only part of the requested bytes. Cleanup happens on the next pass.
-      if(client->step == WEBSERVER_CLIENT_CLOSE) return -1;
+            memcpy(&cpy[out], &((unsigned char *)tmp->data.ptr)[client->ptr], client->totallen);
+            out += client->totallen;
           }
         }
         client->ptr += client->totallen;
@@ -1860,16 +1807,21 @@ static int webserver_process_send(struct webserver_t *client) {
       if(client->async == 1) {
         tcp_write_P(client->pcb, PSTR("\r\n"), 2, TCP_WRITE_FLAG_COPY | TCP_WRITE_FLAG_MORE);
       } else {
-        if(safe_write_P(client,(char *)PSTR("\r\n"), 2) > 0) {
-          if(client->is_websocket == 0) {
-            client->lastseen = millis();
-          }
-        }
-      // Abort this response immediately if the TCP client stalled or accepted
-      // only part of the requested bytes. Cleanup happens on the next pass.
-      if(client->step == WEBSERVER_CLIENT_CLOSE) return -1;
+        cpy[out++] = '\r';
+        cpy[out++] = '\n';
       }
     }
+  }
+
+  if(client->async == 0 && out > 0) {
+    if(safe_write(client, cpy, out) > 0) {
+      if(client->is_websocket == 0) {
+        client->lastseen = millis();
+      }
+    }
+    // Abort this response immediately if the TCP client stalled or accepted
+    // only part of the requested bytes. Cleanup happens on the next pass.
+    if(client->step == WEBSERVER_CLIENT_CLOSE) return -1;
   }
 
   if(tmp == NULL) {
